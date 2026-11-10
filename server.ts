@@ -1,126 +1,98 @@
 import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import express from "express";
+import Fastify from "fastify";
+import fastifyStatic from "@fastify/static";
 
 import { createRequire } from "node:module";
 import { scramjetPath } from "@mercuryworkshop/scramjet/path";
 import { server as wisp } from "@mercuryworkshop/wisp-js/server";
-import { createBareServer } from "@tomphttp/bare-server-node";
-import ipaddr from "ipaddr.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const staticRoot = path.join(__dirname, "dist");
 
-const app = express();
+const app = Fastify({
+	logger: false,
+	serverFactory(handler) {
+		const server = http.createServer((req, res) => {
+			handler(req, res);
+		});
 
-app.use((_req, res, next) => {
-	res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
-	res.setHeader("Cross-Origin-Embedder-Policy", "require-corp");
-	next();
+		server.on("upgrade", (req, socket, head) => {
+			const wispPath = new URL(req.url ?? "/", "http://localhost")
+				.pathname;
+			if (wispPath === "/wisp/") {
+				req.url = wispPath;
+				wisp.routeRequest(req, socket, head);
+				return;
+			}
+			socket.end();
+		});
+
+		return server;
+	}
+});
+
+app.addHook("onSend", async (_request, reply) => {
+	reply.header("Cross-Origin-Opener-Policy", "same-origin");
+	reply.header("Cross-Origin-Embedder-Policy", "require-corp");
 });
 
 const require = createRequire(import.meta.url);
 const dirOf = (specifier: string) => path.dirname(require.resolve(specifier));
 
-app.use("/scram/", express.static(scramjetPath));
-app.use("/utils/", express.static(dirOf("@mercuryworkshop/scramjet-utils")));
-app.use(
-	"/controller/",
-	express.static(dirOf("@mercuryworkshop/scramjet-controller"))
-);
-app.use(
-	"/libcurl/",
-	express.static(dirOf("@mercuryworkshop/libcurl-transport"))
-);
-app.use("/epoxy/", express.static(dirOf("@mercuryworkshop/epoxy-transport")));
-app.use("/baremod/", express.static(dirOf("@mercuryworkshop/bare-transport")));
-
-app.use(
-	express.static(staticRoot, {
-		setHeaders(res, filePath) {
-			if (path.basename(filePath).endsWith("sw.js")) {
-				res.setHeader("Cache-Control", "no-cache");
-			}
+await app.register(fastifyStatic, {
+	root: staticRoot,
+	setHeaders(reply, filePath) {
+		if (path.basename(filePath).endsWith("sw.js")) {
+			reply.header("Cache-Control", "no-cache");
 		}
-	})
-);
-
-const bareServer = createBareServer("/bare/", {
-	filterRemote(url) {
-		const hostname = url.hostname.replace(/^\[|\]$/g, "");
-		if (
-			ipaddr.isValid(hostname) &&
-			ipaddr.parse(hostname).range() !== "unicast"
-		) {
-			throw new RangeError("Forbidden IP");
-		}
-	},
-	connectionLimiter: {
-		maxConnectionsPerIP: 2000,
-		windowDuration: 60,
-		blockDuration: 10
 	}
 });
 
-const handleRequest = (req: http.IncomingMessage, res: http.ServerResponse) => {
-	if (bareServer.shouldRoute(req)) {
-		bareServer.routeRequest(req, res);
-		return;
-	}
-	app(req, res);
-};
-
-const server = http.createServer(handleRequest);
-
-server.on("upgrade", (req, socket, head) => {
-	if (bareServer.shouldRoute(req)) {
-		bareServer.routeUpgrade(req, socket, head);
-		return;
-	}
-	const wispPath = new URL(req.url ?? "/", "http://localhost").pathname;
-	if (wispPath === "/wisp/") {
-		req.url = wispPath;
-		wisp.routeRequest(req, socket, head);
-		return;
-	}
-	socket.end();
+await app.register(fastifyStatic, {
+	root: scramjetPath,
+	prefix: "/scram/",
+	decorateReply: false
+});
+await app.register(fastifyStatic, {
+	root: dirOf("@mercuryworkshop/scramjet-utils"),
+	prefix: "/utils/",
+	decorateReply: false
+});
+await app.register(fastifyStatic, {
+	root: dirOf("@mercuryworkshop/scramjet-controller"),
+	prefix: "/controller/",
+	decorateReply: false
+});
+await app.register(fastifyStatic, {
+	root: dirOf("@mercuryworkshop/libcurl-transport"),
+	prefix: "/libcurl/",
+	decorateReply: false
 });
 
-const listenWithFallback = (
-	target: http.Server,
-	startPort: number,
-	attempts = 20
-) => {
-	let port = startPort;
-	let left = attempts;
+const attempts = 20;
+let port = Number(process.env.PORT) || Number("8080");
 
-	const onError = (error: NodeJS.ErrnoException) => {
-		if (error.code !== "EADDRINUSE" || left-- <= 0) {
-			console.error(`Could not listen on port ${port}: ${error.message}`);
-			process.exit(1);
-		}
+for (let attempt = 0; ; attempt++) {
+	try {
+		await app.listen({ port, host: "0.0.0.0" });
+		break;
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code !== "EADDRINUSE" || attempt >= attempts) throw error;
 		console.warn(`Port ${port} is in use, trying ${port + 1}...`);
 		port += 1;
-		target.listen(port);
-	};
-
-	target.on("error", onError);
-	target.listen(port, () => {
-		target.off("error", onError);
-		process.send?.({ type: "listening", port });
-		console.log(
-			process.env.BACKEND_ONLY
-				? `Backend listening on http://localhost:${port}`
-				: `My Everything Proxy listening on http://localhost:${port}`
-		);
-	});
-};
-
-	const port = Number(process.env.PORT) || Number("8080");
-
-	listenWithFallback(server, port);
-
-	for (const signal of ["SIGINT", "SIGTERM"] as const) {
-		process.on(signal, () => server.close(() => process.exit(0)));
 	}
+}
+
+process.send?.({ type: "listening", port });
+console.log(
+	process.env.BACKEND_ONLY
+		? `Backend listening on http://localhost:${port}`
+		: `My Astropreact Proxy listening on http://localhost:${port}`
+);
+
+for (const signal of ["SIGINT", "SIGTERM"] as const) {
+	process.on(signal, () => void app.close().then(() => process.exit(0)));
+}

@@ -109,8 +109,9 @@ const waitForReport = timeout =>
 
 start(
 	"server",
-	"bun",
+	"bunx",
 	[
+		"tsx",
 		"server.ts"
 	],
 	{ PORT: String(backendPort), BACKEND_ONLY: "1" },
@@ -137,7 +138,8 @@ start(
 	"frontend",
 	"bunx",
 	[
-		"vite"
+		"astro",
+		"dev"
 	],
 	{ BACKEND_PORT: String(boundPort) }
 );
